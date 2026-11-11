@@ -7,7 +7,7 @@ name: uptime
 # recovery closes the issue and says so once.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "3/5 * * * *"
   workflow_dispatch:
 
 permissions:
