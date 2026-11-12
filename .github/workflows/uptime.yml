@@ -1,67 +1,46 @@
 name: uptime
 
-# An outside check of Приборка: every 5 minutes from GitHub, not from the server it watches.
-# Down = /health does not answer "status":"ok" for about 2.5 minutes (5 tries), so a deploy's
-# restart is not an outage. An outage opens one issue labelled `outage` (GitHub notifies the
-# assignee) and, when the TG_BOT_TOKEN and TG_CHAT_IDS secrets are set, a Telegram message;
-# recovery closes the issue and says so once.
+# An outside check of Приборка every 5 minutes, from GitHub rather than from the server it watches.
+# GitHub's scheduler never fired this workflow (11–12.11: only manual runs), so a run does not rely
+# on it: it checks every 5 minutes for about 5 h 40 min and then starts its own successor with
+# workflow_dispatch (the one event GITHUB_TOKEN may start). The schedule stays as a restarter in
+# case the chain ever breaks. Down = no "status":"ok" for ~2.5 min; scripts/probe.sh opens one
+# `outage` issue (GitHub notifies the assignee) and, with TG_BOT_TOKEN and TG_CHAT_IDS set, a
+# Telegram message; recovery closes it.
 on:
   schedule:
-    - cron: "3/5 * * * *"
+    - cron: "17 */2 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
   issues: write
+  actions: write
 
 concurrency:
   group: uptime
   cancel-in-progress: false
 
 jobs:
-  probe:
+  watch:
     runs-on: ubuntu-24.04
-    timeout-minutes: 6
+    timeout-minutes: 355
     env:
       URL: https://priborka-test.noeticecho.space/health
+      GH_TOKEN: ${{ github.token }}
+      TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHATS: ${{ secrets.TG_CHAT_IDS }}
     steps:
-      - name: Probe /health
-        id: p
+      - uses: actions/checkout@v4
+      - name: Check every 5 minutes for ~5 h 40 min
         run: |
-          set +e
-          ok=0; body=""
-          for i in 1 2 3 4 5; do
-            body=$(curl -sS -m 20 "$URL" 2>&1)
-            if echo "$body" | jq -e '.status == "ok"' >/dev/null 2>&1; then ok=1; break; fi
-            [ "$i" -lt 5 ] && sleep 30
+          end=$(( $(date +%s) + 340*60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            started=$(date +%s)
+            ./scripts/probe.sh || true
+            left=$(( 300 - ($(date +%s) - started) ))
+            [ "$left" -gt 0 ] && sleep "$left"
           done
-          echo "ok=$ok" >> "$GITHUB_OUTPUT"
-          { echo "body<<EOB"; echo "$body" | head -c 400; echo; echo "EOB"; } >> "$GITHUB_OUTPUT"
-      - name: Open or close the outage issue
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OK: ${{ steps.p.outputs.ok }}
-          BODY: ${{ steps.p.outputs.body }}
-          TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHATS: ${{ secrets.TG_CHAT_IDS }}
-        run: |
-          notify() {
-            [ -n "$TG_TOKEN" ] || return 0
-            for c in ${TG_CHATS//,/ }; do
-              curl -sS -m 15 -o /dev/null "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-                --data-urlencode "chat_id=$c" --data-urlencode "text=$1" || true
-            done
-          }
-          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label outage --state open --json number --jq '.[0].number // empty')
-          now=$(TZ=Europe/Moscow date '+%d.%m %H:%M МСК')
-          if [ "$OK" = "1" ]; then
-            if [ -n "$open" ]; then
-              gh issue close "$open" -R "$GITHUB_REPOSITORY" -c "Снова отвечает с $now."
-              notify "✅ Приборка снова отвечает ($now)."
-            fi
-          elif [ -z "$open" ]; then
-            gh issue create -R "$GITHUB_REPOSITORY" --label outage --assignee sudo-make-god \
-              --title "Приборка не отвечает ($now)" \
-              --body "$(printf '%s не отвечает «status: ok» около 2,5 минуты (5 попыток).\n\nПоследний ответ:\n```\n%s\n```\n\nЧто делать: docs/ops.md в NoeticTask, раздел о /health.' "$URL" "$BODY")"
-            notify "🔴 Приборка не отвечает ($now). $URL"
-          fi
+      - name: Start the next run
+        if: always()
+        run: gh workflow run uptime.yml -R "$GITHUB_REPOSITORY" --ref main
